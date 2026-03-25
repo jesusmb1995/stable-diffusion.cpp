@@ -41,6 +41,7 @@ struct DiffusionModel {
     virtual int64_t get_adm_in_channels()                            = 0;
     virtual void set_flash_attention_enabled(bool enabled)           = 0;
     virtual void set_circular_axes(bool circular_x, bool circular_y) = 0;
+    virtual void enable_backend_sched(const std::vector<ggml_backend_t>& fallback_backends) {}
 };
 
 struct UNetModel : public DiffusionModel {
@@ -91,6 +92,10 @@ struct UNetModel : public DiffusionModel {
 
     void set_circular_axes(bool circular_x, bool circular_y) override {
         unet.set_circular_axes(circular_x, circular_y);
+    }
+
+    void enable_backend_sched(const std::vector<ggml_backend_t>& fallback_backends) override {
+        unet.enable_backend_sched(fallback_backends);
     }
 
     bool compute(int n_threads,
@@ -158,6 +163,10 @@ struct MMDiTModel : public DiffusionModel {
         mmdit.set_circular_axes(circular_x, circular_y);
     }
 
+    void enable_backend_sched(const std::vector<ggml_backend_t>& fallback_backends) override {
+        mmdit.enable_backend_sched(fallback_backends);
+    }
+
     bool compute(int n_threads,
                  DiffusionParams diffusion_params,
                  struct ggml_tensor** output     = nullptr,
@@ -222,6 +231,10 @@ struct FluxModel : public DiffusionModel {
 
     void set_circular_axes(bool circular_x, bool circular_y) override {
         flux.set_circular_axes(circular_x, circular_y);
+    }
+
+    void enable_backend_sched(const std::vector<ggml_backend_t>& fallback_backends) override {
+        flux.enable_backend_sched(fallback_backends);
     }
 
     bool compute(int n_threads,
@@ -294,6 +307,10 @@ struct AnimaModel : public DiffusionModel {
         anima.set_circular_axes(circular_x, circular_y);
     }
 
+    void enable_backend_sched(const std::vector<ggml_backend_t>& fallback_backends) override {
+        anima.enable_backend_sched(fallback_backends);
+    }
+
     bool compute(int n_threads,
                  DiffusionParams diffusion_params,
                  struct ggml_tensor** output     = nullptr,
@@ -359,6 +376,10 @@ struct WanModel : public DiffusionModel {
 
     void set_circular_axes(bool circular_x, bool circular_y) override {
         wan.set_circular_axes(circular_x, circular_y);
+    }
+
+    void enable_backend_sched(const std::vector<ggml_backend_t>& fallback_backends) override {
+        wan.enable_backend_sched(fallback_backends);
     }
 
     bool compute(int n_threads,
@@ -432,6 +453,10 @@ struct QwenImageModel : public DiffusionModel {
         qwen_image.set_circular_axes(circular_x, circular_y);
     }
 
+    void enable_backend_sched(const std::vector<ggml_backend_t>& fallback_backends) override {
+        qwen_image.enable_backend_sched(fallback_backends);
+    }
+
     bool compute(int n_threads,
                  DiffusionParams diffusion_params,
                  struct ggml_tensor** output     = nullptr,
@@ -497,6 +522,10 @@ struct ZImageModel : public DiffusionModel {
 
     void set_circular_axes(bool circular_x, bool circular_y) override {
         z_image.set_circular_axes(circular_x, circular_y);
+    }
+
+    void enable_backend_sched(const std::vector<ggml_backend_t>& fallback_backends) override {
+        z_image.enable_backend_sched(fallback_backends);
     }
 
     bool compute(int n_threads,
