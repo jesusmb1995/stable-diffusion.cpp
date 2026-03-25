@@ -1661,6 +1661,13 @@ protected:
     ggml_backend_t params_backend  = nullptr;
     ggml_backend_t runtime_backend = nullptr;
 
+    // Multi-backend scheduling: when sched != nullptr, compute() dispatches
+    // ops across all backends in priority order (first = highest priority).
+    // The scheduler queries each backend's supports_op() and routes
+    // unsupported ops to the next backend in the chain.
+    ggml_backend_sched_t sched = nullptr;
+    std::vector<ggml_backend_t> sched_backends;
+
     struct ggml_context* params_ctx             = nullptr;
     ggml_backend_buffer_t params_buffer         = nullptr;
     struct ggml_context* offload_ctx            = nullptr;
@@ -1749,6 +1756,37 @@ protected:
         }
     }
 
+    void init_sched() {
+        if (sched_backends.size() <= 1) {
+            return;
+        }
+        GGML_ASSERT(sched == nullptr);
+        sched = ggml_backend_sched_new(
+            sched_backends.data(),
+            nullptr,
+            sched_backends.size(),
+            MAX_GRAPH_SIZE,
+            false,
+            true);
+        if (sched) {
+            std::string backend_names;
+            for (size_t i = 0; i < sched_backends.size(); i++) {
+                if (i > 0) backend_names += " -> ";
+                backend_names += ggml_backend_name(sched_backends[i]);
+            }
+            LOG_INFO("backend scheduler initialized: %s", backend_names.c_str());
+        } else {
+            LOG_WARN("failed to create backend scheduler, falling back to single-backend path");
+        }
+    }
+
+    void free_sched() {
+        if (sched != nullptr) {
+            ggml_backend_sched_free(sched);
+            sched = nullptr;
+        }
+    }
+
     void prepare_build_in_tensor_before() {
         one_tensor = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_F32, 1);
         ggml_set_name(one_tensor, "ggml_runner_build_in_tensor:one");
@@ -1783,6 +1821,11 @@ protected:
     }
 
     bool alloc_compute_buffer(get_graph_cb_t get_graph) {
+        if (sched != nullptr) {
+            // Scheduler path: allocation is handled inside
+            // ggml_backend_sched_graph_compute(), nothing to pre-allocate.
+            return true;
+        }
         if (compute_allocr != nullptr) {
             return true;
         }
@@ -1949,7 +1992,24 @@ public:
         }
     }
 
+    // Multi-backend constructor: backends_arr[0] = highest priority (compute),
+    // backends_arr[n-1] = lowest priority (fallback, typically CPU).
+    // The scheduler auto-dispatches each op to the first backend that supports it.
+    GGMLRunner(ggml_backend_t* backends_arr, size_t n_backends,
+               bool offload_params_to_cpu = false)
+        : runtime_backend(backends_arr[0]),
+          sched_backends(backends_arr, backends_arr + n_backends) {
+        alloc_params_ctx();
+        if (!ggml_backend_is_cpu(runtime_backend) && offload_params_to_cpu) {
+            params_backend = ggml_backend_cpu_init();
+        } else {
+            params_backend = runtime_backend;
+        }
+        init_sched();
+    }
+
     virtual ~GGMLRunner() {
+        free_sched();
         free_params_buffer();
         free_compute_buffer();
         free_params_ctx();
@@ -2064,6 +2124,11 @@ public:
             LOG_ERROR("%s offload params to runtime backend failed", get_desc().c_str());
             return false;
         }
+
+        if (sched != nullptr) {
+            return compute_sched(get_graph, n_threads, free_compute_buffer_immediately, output, output_ctx);
+        }
+
         if (!alloc_compute_buffer(get_graph)) {
             LOG_ERROR("%s alloc compute buffer failed", get_desc().c_str());
             return false;
@@ -2104,6 +2169,51 @@ public:
         return true;
     }
 
+private:
+    bool compute_sched(get_graph_cb_t get_graph,
+                       int n_threads,
+                       bool free_compute_buffer_immediately,
+                       struct ggml_tensor** output,
+                       struct ggml_context* output_ctx) {
+        reset_compute_ctx();
+        struct ggml_cgraph* gf = get_compute_graph(get_graph);
+        copy_data_to_backend_tensor();
+
+        for (auto& b : sched_backends) {
+            if (ggml_backend_is_cpu(b)) {
+                ggml_backend_cpu_set_n_threads(b, n_threads);
+            }
+        }
+
+        ggml_backend_sched_reset(sched);
+
+        ggml_status status = ggml_backend_sched_graph_compute(sched, gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            LOG_ERROR("%s sched compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+            return false;
+        }
+#ifdef GGML_PERF
+        ggml_graph_print(gf);
+#endif
+        copy_cache_tensors_to_cache_buffer();
+        if (output != nullptr) {
+            auto result = ggml_get_tensor(compute_ctx, final_result_name.c_str());
+            if (*output == nullptr && output_ctx != nullptr) {
+                *output = ggml_dup_tensor(output_ctx, result);
+            }
+            if (*output != nullptr) {
+                ggml_ext_backend_tensor_get_and_sync(runtime_backend, result, (*output)->data, 0, ggml_nbytes(*output));
+            }
+        }
+
+        if (free_compute_buffer_immediately) {
+            free_compute_buffer();
+        }
+        return true;
+    }
+
+public:
+
     void set_flash_attention_enabled(bool enabled) {
         flash_attn_enabled = enabled;
     }
@@ -2119,6 +2229,31 @@ public:
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {
         weight_adapter = adapter;
+    }
+
+    // Enable multi-backend scheduling on an already-constructed runner.
+    // fallback_backends are additional backends to try when runtime_backend
+    // does not support an op. Typically: {cpu_backend}.
+    // The priority chain becomes: runtime_backend -> fallback_backends[0] -> ...
+    void enable_backend_sched(const std::vector<ggml_backend_t>& fallback_backends) {
+        if (fallback_backends.empty()) {
+            return;
+        }
+        free_sched();
+        sched_backends.clear();
+        sched_backends.push_back(runtime_backend);
+        for (auto* b : fallback_backends) {
+            if (b != runtime_backend) {
+                sched_backends.push_back(b);
+            }
+        }
+        if (sched_backends.size() > 1) {
+            init_sched();
+        }
+    }
+
+    bool has_backend_sched() const {
+        return sched != nullptr;
     }
 };
 

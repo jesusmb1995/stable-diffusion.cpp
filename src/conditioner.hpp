@@ -41,6 +41,7 @@ struct Conditioner {
     virtual size_t get_params_buffer_size()                                                = 0;
     virtual void set_flash_attention_enabled(bool enabled)                                 = 0;
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {}
+    virtual void enable_backend_sched(const std::vector<ggml_backend_t>& fallback_backends) {}
     virtual std::tuple<SDCondition, std::vector<bool>> get_learned_condition_with_trigger(ggml_context* work_ctx,
                                                                                           int n_threads,
                                                                                           const ConditionerParams& conditioner_params) {
@@ -125,6 +126,13 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         text_model->set_flash_attention_enabled(enabled);
         if (sd_version_is_sdxl(version)) {
             text_model2->set_flash_attention_enabled(enabled);
+        }
+    }
+
+    void enable_backend_sched(const std::vector<ggml_backend_t>& fallback_backends) override {
+        text_model->enable_backend_sched(fallback_backends);
+        if (text_model2) {
+            text_model2->enable_backend_sched(fallback_backends);
         }
     }
 

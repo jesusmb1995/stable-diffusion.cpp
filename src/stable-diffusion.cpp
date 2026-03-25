@@ -101,10 +101,11 @@ void suppress_pp(int step, int steps, float time, void* data) {
 
 class StableDiffusionGGML {
 public:
-    ggml_backend_t backend             = nullptr;  // general backend
-    ggml_backend_t clip_backend        = nullptr;
-    ggml_backend_t control_net_backend = nullptr;
-    ggml_backend_t vae_backend         = nullptr;
+    ggml_backend_t backend              = nullptr;  // general backend
+    ggml_backend_t clip_backend         = nullptr;
+    ggml_backend_t control_net_backend  = nullptr;
+    ggml_backend_t vae_backend          = nullptr;
+    ggml_backend_t cpu_fallback_backend = nullptr;  // for multi-backend scheduling
 
     SDVersion version;
     bool vae_decode_only         = false;
@@ -165,6 +166,9 @@ public:
             ggml_backend_free(vae_backend);
         }
         ggml_backend_free(backend);
+        if (cpu_fallback_backend != nullptr) {
+            ggml_backend_free(cpu_fallback_backend);
+        }
     }
 
     void init_backend() {
@@ -983,6 +987,40 @@ public:
 
         ggml_free(ctx);
         use_tiny_autoencoder = use_tiny_autoencoder && !tae_preview_only;
+
+        // Enable multi-backend scheduling: when the primary backend is not CPU,
+        // create a CPU fallback so ops unsupported by the GPU/NPU backend
+        // automatically fall through to CPU instead of crashing.
+        if (!ggml_backend_is_cpu(backend)) {
+            cpu_fallback_backend = ggml_backend_cpu_init();
+            if (cpu_fallback_backend) {
+                std::vector<ggml_backend_t> fallbacks = {cpu_fallback_backend};
+
+                if (diffusion_model) {
+                    diffusion_model->enable_backend_sched(fallbacks);
+                }
+                if (high_noise_diffusion_model) {
+                    high_noise_diffusion_model->enable_backend_sched(fallbacks);
+                }
+                // CLIP and VAE already have their own dedicated backends
+                // (clip_backend, vae_backend) which may be CPU. Only enable
+                // scheduling if they are on a GPU backend.
+                if (cond_stage_model && !ggml_backend_is_cpu(clip_backend)) {
+                    cond_stage_model->enable_backend_sched(fallbacks);
+                }
+                if (first_stage_model && !ggml_backend_is_cpu(vae_backend)) {
+                    first_stage_model->enable_backend_sched(fallbacks);
+                }
+                if (tae_first_stage && !ggml_backend_is_cpu(vae_backend)) {
+                    tae_first_stage->enable_backend_sched(fallbacks);
+                }
+                if (control_net && !ggml_backend_is_cpu(control_net_backend)) {
+                    control_net->enable_backend_sched(fallbacks);
+                }
+                LOG_INFO("multi-backend scheduling enabled (fallback: CPU)");
+            }
+        }
+
         return true;
     }
 
